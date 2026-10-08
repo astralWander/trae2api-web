@@ -74,8 +74,8 @@ func main() {
 			_ = a.SaveAtomic()
 		}
 
-		// 签到
-		checkedIn, _, enable, serr := up.CheckinStatus(a)
+		// 签到（status → 未签且开放则 claim；9074 高峰拥堵自动退避重试）
+		res, serr := up.Checkin(a)
 		switch {
 		case serr != nil:
 			if isAlready(serr.Error()) {
@@ -87,23 +87,17 @@ func main() {
 				r.detail = short(serr.Error())
 				failN++
 			}
-		case checkedIn:
+		case res == upstream.CheckinAlready:
 			r.status = "ALREADY"
 			r.detail = "already checked in"
 			alreadyN++
-		case !enable:
+		case res == upstream.CheckinDisabled:
 			r.status = "FAIL"
 			r.detail = "checkin disabled"
 			failN++
 		default:
-			if err := up.CheckinClaim(a); err != nil {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
-			} else {
-				r.status = "OK"
-				okN++
-			}
+			r.status = "OK"
+			okN++
 		}
 		// 查积分
 		if remain, qerr := up.UserEntUsage(a); qerr == nil {

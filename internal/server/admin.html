@@ -94,6 +94,7 @@
     <h1>trae2api-web 控制台<small>凭证管理 · 额度监控</small></h1>
     <div class="toolbar">
       <span id="ts"></span>
+      <button class="btn primary" id="ckBtn" onclick="doCheckin('')">一键签到</button>
       <button class="btn" onclick="refreshActive()">刷新</button>
     </div>
   </header>
@@ -103,8 +104,10 @@
     <input id="apikey" type="password" placeholder="TW2A_API_KEY（写操作必填，点「记忆」保存）" oninput="onKeyChange()">
     <button class="btn sm" onclick="saveKey()">保存</button>
     <span id="keystatus" class="saved" style="display:none">已记忆</span>
-    <span style="margin-left:auto;font-size:11px">列表/额度为只读；导入/删除/开关/登录需 Key</span>
+    <span style="margin-left:auto;font-size:11px">列表/额度为只读；导入/删除/开关/登录/签到需 Key</span>
   </div>
+
+  <div id="ckStatus" class="login-status" style="display:none;margin:-4px 0 14px"></div>
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
@@ -133,6 +136,10 @@
 
   <!-- 额度监控 -->
   <div id="pane-credits" class="pane">
+    <div class="login-bar" style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+      <h2 style="margin:0">额度监控<small style="color:var(--dim);font-weight:400;font-size:12px;margin-left:8px">实时查询上游额度与签到状态</small></h2>
+      <button class="btn primary" onclick="doCheckin('')">一键签到</button>
+    </div>
     <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 切换到「账号管理」tab 查看详情，或点刷新</div></div>
   </div>
 </div>
@@ -191,10 +198,57 @@ async function loadAccounts(){
     const r = await fetch('/admin/api/accounts', {cache:'no-store'});
     const d = await r.json();
     renderAccounts(d.accounts||[]);
+    enrichAccountCredits();
     document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){
     document.getElementById('acctTable').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'（服务是否在运行？）</div>';
   }
+}
+
+/* 账号管理表格的积分列来自池内缓存（初始为 0），这里异步用实时额度补齐 */
+async function enrichAccountCredits(){
+  try{
+    const r = await fetch('/admin/api/credits', {cache:'no-store'});
+    const d = await r.json();
+    const map = {};
+    (d.accounts||[]).forEach(a=>{ map[a.uid] = a; });
+    document.querySelectorAll('[data-credit-uid]').forEach(td=>{
+      const a = map[td.getAttribute('data-credit-uid')];
+      if(!a) return;
+      if(a.error){ td.innerHTML = '<span style="color:var(--bad)" title="'+esc(a.error)+'">查询失败</span>'; return; }
+      td.textContent = fmt(a.remain);
+      td.title = '总量 '+fmt(a.limit)+' · 已用 '+fmt(a.used)+(a.checkin_enable?(' · 今日可领 '+fmt(a.checkin_credits)):'');
+    });
+  }catch(e){ /* 实时额度拉取失败则保留缓存值 */ }
+}
+
+/* ─── 签到 ─── */
+async function doCheckin(uid){
+  const st = document.getElementById('ckStatus');
+  const btn = document.getElementById('ckBtn');
+  st.style.display=''; st.className='login-status';
+  st.textContent = (uid ? '正在签到 ' + uid : '正在批量签到全部账号') + '...（高峰可能重试，请稍候）';
+  if(btn) btn.disabled = true;
+  try{
+    const r = await fetch('/admin/api/checkin', {
+      method:'POST',
+      headers:{'Content-Type':'application/json', ...authHeader()},
+      body: JSON.stringify(uid ? {uid} : {})
+    });
+    const d = await r.json();
+    if(!r.ok){ st.className='login-status err'; st.textContent='签到失败：'+apiErr(d); return; }
+    const s = d.summary || {};
+    st.className = (s.fail > 0) ? 'login-status err' : 'login-status ok';
+    let msg = '签到完成：成功 '+fmt(s.ok)+' · 已签 '+fmt(s.already)+' · 未开放 '+fmt(s.disabled)+' · 失败 '+fmt(s.fail);
+    const fails = (d.results||[]).filter(x=>x.status==='fail');
+    if(fails.length){
+      msg += ' — ' + fails.map(f=>esc(f.nickname||f.uid)+'：'+esc(f.detail||'未知错误')).join('；');
+    }
+    st.textContent = msg;
+    loadAccounts();
+    if(activeTab==='credits') loadCredits();
+  }catch(e){ st.className='login-status err'; st.textContent='签到失败：'+e.message; }
+  finally{ if(btn) btn.disabled = false; }
 }
 function renderAccounts(accts){
   const el = document.getElementById('acctTable');
@@ -216,11 +270,12 @@ function renderAccounts(accts){
       + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
       + '<td>'+badges+(a.reason?'<div class="mono" style="margin-top:4px">'+esc(a.reason)+'</div>':'')+'</td>'
-      + '<td class="mono">'+fmt(a.credits)+'</td>'
+      + '<td class="mono" data-credit-uid="'+esc(a.uid)+'">'+fmt(a.credits)+'</td>'
       + '<td class="mono">'+esc(exp)+'</td>'
       + '<td class="mono">'+esc(a.machine_id||'-')+' / '+esc(a.device_id||'-')+'</td>'
       + '<td><div class="row-actions">'
       + '<label class="toggle"><input type="checkbox" '+toggleChecked+' '+toggleDisabled+' onchange="toggleAcct(\''+esc(a.uid)+'\', this.checked)"><span class="slider"></span></label>'
+      + '<button class="btn sm" onclick="doCheckin(\''+esc(a.uid)+'\')">签到</button>'
       + '<button class="btn sm" onclick="refreshAcct(\''+esc(a.uid)+'\')">刷新token</button>'
       + '<button class="btn sm" onclick="showJSON(\''+esc(a.uid)+'\')">JSON</button>'
       + '<button class="btn sm danger" onclick="deleteAcct(\''+esc(a.uid)+'\')">删除</button>'

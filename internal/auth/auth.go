@@ -3,6 +3,8 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -53,6 +55,45 @@ func (a *Auth) JWT() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.AccessToken
+}
+
+// DeviceIDValue 返回当前 deviceID 的读锁快照（Ensure/Rotate 会改写该字段）。
+func (a *Auth) DeviceIDValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.DeviceID
+}
+
+// EnsureDeviceID 若未设置 deviceID，则生成一个 32 位 hex 随机设备号写入内存。
+// 返回是否本次新生成（调用方据此决定是否 SaveAtomic 落盘）。
+//
+// 背景：签到 claim 接口要求带 X-Device-Id 头，缺失会返回 9004
+// "The submitted order parameters are incorrect"（实测）。
+func (a *Auth) EnsureDeviceID() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.DeviceID != "" {
+		return false
+	}
+	a.DeviceID = newDeviceID()
+	return true
+}
+
+// RotateDeviceID 强制换一个新的设备号（仅内存）。
+// 用于 9074「当前参与用户太多」——服务端会记住被高频使用的设备号，换号可提高成功率。
+func (a *Auth) RotateDeviceID() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.DeviceID = newDeviceID()
+}
+
+// newDeviceID 生成 32 位 hex 随机设备号（16 字节）。
+func newDeviceID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // RefreshTokenValue 返回当前 refreshToken 的读锁快照，防与 RefreshToken 写并发竞态。

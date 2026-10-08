@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ const (
 	ErrNotFound                   // 404 → 短冷却 60s 不累计 errCount
 	ErrServer                     // 5xx
 	ErrClient                     // 其他 4xx
+	ErrCheckinBusy                // 9074 签到人数过多（HTTP 200 业务码）→ 可退避重试
 )
 
 func (k ErrKind) String() string {
@@ -42,19 +44,25 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrCheckinBusy:
+		return "checkin_busy"
 	default:
 		return "none"
 	}
 }
 
-// Error 带分类的上游错误。
+// Error 带分类的上游错误。Code 为业务错误码（HTTP 200 响应体里的 code），无则为 0。
 type Error struct {
 	Kind   ErrKind
 	Status int
+	Code   int64
 	Msg    string
 }
 
 func (e *Error) Error() string {
+	if e.Code != 0 {
+		return fmt.Sprintf("upstream %s (http %d, code %d): %s", e.Kind, e.Status, e.Code, e.Msg)
+	}
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
@@ -89,6 +97,42 @@ func Classify(status int, body string) ErrKind {
 		return ErrClient
 	}
 	return ErrNone
+}
+
+// ClassifyBusiness 按响应体里的业务 code 分类（TRAE 惯例：HTTP 200 + {"code":N}）。
+// code == 0 视为成功；未知非 0 归 ErrClient。
+func ClassifyBusiness(code int64) ErrKind {
+	switch code {
+	case 0:
+		return ErrNone
+	case 1001:
+		return ErrSessionDead
+	case 1005, 4008:
+		return ErrPlanLimit
+	case 4011, 9074:
+		// 4011 请求频率超限 / 9074 签到人数过多 → 可重试
+		return ErrCheckinBusy
+	default:
+		return ErrClient
+	}
+}
+
+// businessCode 从响应体提取业务 code/message。无 code 字段（如纯数据响应）返回 0。
+// 兼容 message / msg 两种字段名。
+func businessCode(raw json.RawMessage) (int64, string) {
+	var env struct {
+		Code    *int64 `json:"code"`
+		Message string `json:"message"`
+		Msg     string `json:"msg"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil || env.Code == nil {
+		return 0, ""
+	}
+	msg := env.Message
+	if msg == "" {
+		msg = env.Msg
+	}
+	return *env.Code, msg
 }
 
 // Client SOLO 上游 HTTP 客户端。Host 字段可覆盖便于测试。
@@ -139,6 +183,14 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+	}
+	// 业务错误：HTTP 200 但响应体 code != 0（TRAE UG 接口惯例，如 9074 签到人数过多）。
+	// 不校验会导致 CheckinClaim 把业务失败当成功、CheckinStatus 解析出全零误判为 "未开放"。
+	if code, msg := businessCode(raw); code != 0 {
+		if msg == "" {
+			msg = truncate(string(raw), 200)
+		}
+		return nil, &Error{Kind: ClassifyBusiness(code), Status: resp.StatusCode, Code: code, Msg: msg}
 	}
 	return raw, nil
 }
@@ -319,9 +371,92 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// CheckinResult 一次签到流程的结果。
+type CheckinResult int
+
+const (
+	CheckinDone     CheckinResult = iota // 本次签到成功
+	CheckinAlready                       // 今日已签到
+	CheckinDisabled                      // 签到未开放（enable=false）
+)
+
+// String 便于日志/接口输出。
+func (r CheckinResult) String() string {
+	switch r {
+	case CheckinDone:
+		return "ok"
+	case CheckinAlready:
+		return "already"
+	case CheckinDisabled:
+		return "disabled"
+	default:
+		return "unknown"
+	}
+}
+
+// checkinRetryDelays 9074「签到人数过多」等可重试错误的退避间隔。
+// 变量形式便于测试缩短。
+var checkinRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
+
+// Checkin 执行一次完整签到：查状态 → 未签且开放则 claim。
+// 遇到 9074（签到人数过多）等可重试错误按 checkinRetryDelays 退避重试。
+// 返回的 error 仅在真正失败（网络/业务错误）时非 nil；已签到/未开放走 result。
+func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		res, err := c.checkinOnce(a)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		var ue *Error
+		if errors.As(err, &ue) && ue.Kind == ErrCheckinBusy && attempt < len(checkinRetryDelays) {
+			// 9074 多因服务端记住了该设备号，换一个新设备号再试。
+			if ue.Code == 9074 {
+				a.RotateDeviceID()
+			}
+			time.Sleep(checkinRetryDelays[attempt])
+			continue
+		}
+		return res, lastErr
+	}
+}
+
+// checkinOnce 单次签到（不重试）。
+func (c *Client) checkinOnce(a *auth.Auth) (CheckinResult, error) {
+	checkedIn, _, enable, err := c.CheckinStatus(a)
+	if err != nil {
+		return CheckinDisabled, err
+	}
+	if checkedIn {
+		return CheckinAlready, nil
+	}
+	if !enable {
+		return CheckinDisabled, nil
+	}
+	if err := c.CheckinClaim(a); err != nil {
+		return CheckinDisabled, err
+	}
+	return CheckinDone, nil
+}
+
+// checkinReqBody 签到接口请求体（与桌面端一致；空 body 会被上游拒绝）。
+var checkinReqBody = []byte(`{"req_source":1}`)
+
+// ensureDeviceID 确保账号已有 deviceID（claim 接口必填，缺失 → 9004），必要时生成并落盘。
+func (c *Client) ensureDeviceID(a *auth.Auth) {
+	if a.DeviceIDValue() != "" {
+		return
+	}
+	if a.EnsureDeviceID() && a.FilePath != "" {
+		_ = a.SaveAtomic()
+	}
+}
+
 // CheckinStatus 查询签到状态。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader([]byte("{}")))
+	c.ensureDeviceID(a)
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader(checkinReqBody))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -343,7 +478,8 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 
 // CheckinClaim 执行签到。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader([]byte("{}")))
+	c.ensureDeviceID(a)
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader(checkinReqBody))
 	if err != nil {
 		return err
 	}

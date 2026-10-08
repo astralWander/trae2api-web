@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"trae2api-web/internal/auth"
 )
@@ -266,5 +267,101 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 	}
 	if path != EpCheckinStatus {
 		t.Errorf("path=%s", path)
+	}
+}
+
+func TestClassifyBusiness(t *testing.T) {
+	cases := map[int64]ErrKind{
+		0:    ErrNone,
+		1001: ErrSessionDead,
+		1005: ErrPlanLimit,
+		4008: ErrPlanLimit,
+		4011: ErrCheckinBusy,
+		9074: ErrCheckinBusy,
+		9999: ErrClient,
+	}
+	for code, want := range cases {
+		if got := ClassifyBusiness(code); got != want {
+			t.Errorf("ClassifyBusiness(%d)=%v want %v", code, got, want)
+		}
+	}
+}
+
+// HTTP 200 + 业务错误码必须被识别为错误，而不是被当成"未开放"或"成功"——
+// 这是签到失败却报 checkin disabled / 假成功的根因。
+func TestCheckinStatusBusinessErrorSurfaced(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":9074,"message":"当前使用人数太多"}`), nil
+	})
+	_, _, _, err := c.CheckinStatus(&auth.Auth{AccessToken: "at"})
+	if err == nil {
+		t.Fatal("HTTP200 business code 9074 must surface as error")
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrCheckinBusy || ue.Code != 9074 {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// claim 返回 200+9074 时，Checkin 绝不能报成功。
+func TestCheckinClaimBusinessErrorNotSilent(t *testing.T) {
+	old := checkinRetryDelays
+	checkinRetryDelays = nil
+	defer func() { checkinRetryDelays = old }()
+
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			return jsonResp(200, `{"code":9074,"message":"当前使用人数太多"}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
+	})
+	if _, err := c.Checkin(&auth.Auth{AccessToken: "at"}); err == nil {
+		t.Fatal("claim business error must not be reported as success")
+	}
+}
+
+// 9074 高峰拥堵应自动退避重试，重试后成功返回 CheckinDone。
+func TestCheckinRetriesBusyThenSucceeds(t *testing.T) {
+	old := checkinRetryDelays
+	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { checkinRetryDelays = old }()
+
+	var claimN int
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			claimN++
+			if claimN < 3 {
+				return jsonResp(200, `{"code":9074,"message":"当前使用人数太多"}`), nil
+			}
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
+	})
+	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if res != CheckinDone || claimN != 3 {
+		t.Fatalf("res=%v claimN=%d want CheckinDone/3", res, claimN)
+	}
+}
+
+func TestCheckinAlready(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"checked_in":true,"credits":0,"enable":true}`), nil
+	})
+	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err != nil || res != CheckinAlready {
+		t.Fatalf("res=%v err=%v", res, err)
+	}
+}
+
+func TestCheckinDisabled(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"checked_in":false,"credits":0,"enable":false}`), nil
+	})
+	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err != nil || res != CheckinDisabled {
+		t.Fatalf("res=%v err=%v", res, err)
 	}
 }

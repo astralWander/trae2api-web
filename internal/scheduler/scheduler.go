@@ -97,18 +97,17 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		// 签到（status → 未签到则 claim）
-		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
-		if err != nil {
-			log.Printf("checkin status %s: %v", st.UID, err)
-		} else if !checkedIn && enable {
-			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				log.Printf("checkin claim %s: %v", st.UID, err)
-			} else {
-				log.Printf("checkin %s: ok", st.UID)
-			}
-		} else if checkedIn {
+		// 签到（status → 未签且开放则 claim；9074 高峰拥堵自动退避重试）
+		res, err := s.cfg.Upstream.Checkin(a)
+		switch {
+		case err != nil:
+			log.Printf("checkin %s: %v", st.UID, err)
+		case res == upstream.CheckinDone:
+			log.Printf("checkin %s: ok", st.UID)
+		case res == upstream.CheckinAlready:
 			log.Printf("checkin %s: already checked in", st.UID)
+		default:
+			log.Printf("checkin %s: disabled", st.UID)
 		}
 		// 查积分 + 解冻
 		remain, err := s.cfg.Upstream.UserEntUsage(a)
