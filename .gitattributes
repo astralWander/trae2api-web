@@ -1,0 +1,10 @@
+# 行尾统一策略
+#
+# 本仓库常在 Windows 上编辑、在 Linux 上部署，而 Windows 的
+# core.autocrlf=true 会把文件检出成 CRLF。对文本、代码无碍，
+# 但下面这两类一旦带上 \r 就会直接跑不起来：
+#   - shell 脚本：Linux 报 `bash: ./x.sh: /usr/bin/env bash^M: bad interpreter`
+#   - Dockerfile：CRLF 会渗进 RUN 指令，导致命令凭空多一个 \r
+# 故显式声明为 LF，与开发机设置无关。
+*.sh       text eol=lf
+Dockerfile text eol=lf
