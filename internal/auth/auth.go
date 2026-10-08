@@ -286,12 +286,20 @@ func (a *Auth) SaveAtomic() error {
 	return a.saveAtomicLocked()
 }
 
-// saveAtomicLocked 是 SaveAtomic 的持锁内部版本；调用方必须已持有 a.mu。
-func (a *Auth) saveAtomicLocked() error {
-	if a.FilePath == "" {
-		return fmt.Errorf("no FilePath set")
-	}
-	doc := map[string]any{
+// CredentialsDoc 返回嵌套形凭证文档（{"auth":..,"account":..}），
+// 与磁盘 trae-*.json 同构，可直接 json.Marshal 后喂给 Parse。
+//
+// 供账号导出接口 / 本地签到程序复用：两端共用同一序列化口径，
+// 避免字段名漂移导致「导出的凭证本地解不开」。
+func (a *Auth) CredentialsDoc() map[string]any {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.credentialsDocLocked()
+}
+
+// credentialsDocLocked 是 CredentialsDoc 的持锁内部版本；调用方必须已持有 a.mu。
+func (a *Auth) credentialsDocLocked() map[string]any {
+	return map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
 			"refreshToken": a.RefreshToken,
@@ -308,6 +316,14 @@ func (a *Auth) saveAtomicLocked() error {
 			"nickname":     a.Nickname,
 		},
 	}
+}
+
+// saveAtomicLocked 是 SaveAtomic 的持锁内部版本；调用方必须已持有 a.mu。
+func (a *Auth) saveAtomicLocked() error {
+	if a.FilePath == "" {
+		return fmt.Errorf("no FilePath set")
+	}
+	doc := a.credentialsDocLocked()
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err

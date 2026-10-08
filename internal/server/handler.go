@@ -88,6 +88,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.adminAccountJSON)
 	// 签到（写操作，需 Key）
 	h.mux.HandleFunc("POST /admin/api/checkin", h.withAdminAuth(h.adminCheckin))
+	// 账号导出（返回未脱敏凭证，需 Key；未配 Key 时 403）——供本地签到程序拉取
+	h.mux.HandleFunc("GET /admin/api/accounts/export", h.withAdminAuth(h.adminExportAccounts))
+	// 本地签到结果回报（写操作，需 Key）：回写积分 + 续期凭证
+	h.mux.HandleFunc("POST /admin/api/checkin/report", h.withAdminAuth(h.adminCheckinReport))
 	// Web 登录闭环
 	h.mux.HandleFunc("POST /admin/api/login", h.withAdminAuth(h.adminLoginStart))
 	h.mux.HandleFunc("GET /admin/api/login/result", h.adminLoginResult)

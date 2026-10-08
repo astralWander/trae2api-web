@@ -114,6 +114,60 @@ curl -s http://127.0.0.1:7864/admin | grep -o '构建 <b>[^<]*</b>'
 > 若显示 `unknown`，说明二进制未带 VCS 信息 —— 请在 git 仓库目录内重新 `go build`（不要用 `-buildvcs=false`）。
 > 带 `-dirty` 后缀表示构建时工作区有未提交改动。
 
+## 在本地（家宽 IP）执行签到
+
+云服务器 / 机房 IP 段常被上游风控限制签到：`status` 明确说「可领 100」，`claim` 却恒定返回
+`9074 当前参与用户太多`（换设备号、换 UA、退避重试均无效，因为限流维度是**出口 IP**）。
+
+对策是把「签到」这一跳挪到你本机执行，服务器只当账号仓库：
+
+```
+本机 ──GET  /admin/api/accounts/export──▶ 服务器（取账号，未脱敏）
+本机 ──POST api.trae.cn checkin/claim──▶ TRAE（用本机 IP 签到）
+本机 ──POST /admin/api/checkin/report──▶ 服务器（回报结果 + 续期后的凭证）
+```
+
+### 1) 服务端：开通导出接口
+
+导出接口返回**未脱敏**的完整 token，因此必须配置 `TW2A_API_KEY`（未配置直接 `403`）：
+
+```bash
+# 启动服务时带上 Key
+TW2A_API_KEY=你的密钥 ./trae2api-web
+```
+
+### 2) 本地：运行签到程序
+
+```bash
+# 编译（在仓库目录内）
+go build -o localcheckin ./cmd/localcheckin
+
+# 只拉取并体检账号（验证是否拉取成功，不签到）
+./localcheckin -server http://你的服务器:7864 -key 你的密钥 -dry-run
+
+# 在本机执行签到
+./localcheckin -server http://你的服务器:7864 -key 你的密钥
+```
+
+也可用环境变量：`TW2A_SERVER`、`TW2A_API_KEY`。
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `-server` | 服务端地址（默认 `http://127.0.0.1:7864`） |
+| `-key` | 服务端 API Key（或用 `TW2A_API_KEY`） |
+| `-uid` | 只处理指定账号 |
+| `-dry-run` | 只拉取并打印账号清单（含 deviceId 形态体检） |
+| `-report=false` | 不把结果回报服务端 |
+| `-save <dir>` | 把拉到的账号落盘到本地目录（默认仅内存） |
+| `-all` | 包含 session 失效账号（默认跳过） |
+| `-concurrency` | 并发账号数，默认 1（顺序执行最不易撞上游限流） |
+
+> **Token 续期提示**：本地签到会在 token 临近过期时自动续期，续期会**轮换 refreshToken**。
+> 程序默认把这批账号的新凭证回报服务端（`-report`），避免服务端手里那份旧凭证失效。
+> 除非你清楚后果，否则不要关闭 `-report`。
+
 ## API 调用示例
 
 ### 对话补全 (Chat Completions)
