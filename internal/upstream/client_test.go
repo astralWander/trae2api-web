@@ -354,6 +354,65 @@ func TestCheckinRetriesDeniedThenSucceeds(t *testing.T) {
 	}
 }
 
+// 9074 连续多次后成功：应完整走完退避重试序列（覆盖 1+len(delays) 次尝试）。
+func TestCheckinRetriesDeniedMultipleTimesThenSucceeds(t *testing.T) {
+	old := checkinRetryDelays
+	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond, time.Millisecond}
+	defer func() { checkinRetryDelays = old }()
+
+	const failN = 4 // 前 4 次 9074，第 5 次成功
+	var claimN int
+	done := false
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			claimN++
+			if claimN <= failN {
+				return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
+			}
+			done = true
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		}
+		if done {
+			return jsonResp(200, `{"checked_in":true,"credits":100,"enable":true}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
+	})
+	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if res != CheckinDone || claimN != failN+1 {
+		t.Fatalf("res=%v claimN=%d want CheckinDone/%d", res, claimN, failN+1)
+	}
+}
+
+// 9074 重试全部耗尽仍失败 → 返回错误且带 code 9074（绝不谎报成功）。
+func TestCheckinRetriesExhaustedFails(t *testing.T) {
+	old := checkinRetryDelays
+	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	defer func() { checkinRetryDelays = old }()
+
+	var claimN int
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			claimN++
+			return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
+	})
+	_, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err == nil {
+		t.Fatal("exhausted retries must fail")
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Code != 9074 {
+		t.Fatalf("err=%v want code 9074", err)
+	}
+	if claimN != 3 { // 首次 + 2 次重试
+		t.Fatalf("claimN=%d want 3", claimN)
+	}
+}
+
 // claim 返回 code 0 但回查 status 仍 checked_in=false → 判失败，绝不谎报成功。
 func TestCheckinCodeZeroButNotEffective(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {

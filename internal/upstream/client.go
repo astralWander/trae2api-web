@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -27,7 +28,7 @@ const (
 	ErrNotFound                   // 404 → 短冷却 60s 不累计 errCount
 	ErrServer                     // 5xx
 	ErrClient                     // 其他 4xx
-	ErrCheckinDenied              // 9074 签到专属拒绝（HTTP 200 业务码）→ 可单次快速重试
+	ErrCheckinDenied              // 9074 签到瞬时限流（HTTP 200 业务码）→ 多次退避重试
 )
 
 func (k ErrKind) String() string {
@@ -397,18 +398,29 @@ func (r CheckinResult) String() string {
 	}
 }
 
-// checkinRetryDelays 9074「签到专属拒绝」的重试间隔。
+// checkinRetryDelays 9074「当前参与用户太多」的退避重试间隔。
 //
-// 上游 9074 是**账号级稳定拒绝**（实测：同账号 40 余次请求全 9074，换 deviceId/token/
-// UA/region/body 均无效），不是短时抖动。保留一次快速重试只为兜「万一上游恢复成真
-// 抖动」，落空即判失败，不空耗 8s。变量形式便于测试缩短。
-var checkinRetryDelays = []time.Duration{time.Second}
+// 2026-10-08 实测订正：9074 是**瞬时限流**，不是账号级永久拒绝——
+// 同一账号同一设备号，首次 9074、数秒后重试即 code 0 成功；并发批量签到的
+// 后几个账号最易被短时限流（面板 5 账号并发时命中 1 个）。此前"账号级稳定
+// 拒绝 / 重试几乎必空"的结论已被推翻，故改为多次退避重试。
+// 变量形式便于测试缩短。
+var checkinRetryDelays = []time.Duration{time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second}
+
+// checkinRetryJitter 在退避基础上叠加 0~d/2 的随机抖动。
+// 批量签到时各账号重试步调若完全一致，会同时再次撞上限流；抖动把它们错开。
+func checkinRetryJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(d/2) + 1))
+}
 
 // checkinAlreadyCode 今日已签到（幂等成功，不算失败）。
 const checkinAlreadyCode = 9095
 
 // Checkin 执行一次完整签到：查状态 → 未签且开放则 claim → 回查确认。
-// 遇到 9074（签到专属拒绝）按 checkinRetryDelays 单次快速重试。
+// 遇到 9074（瞬时限流）按 checkinRetryDelays 退避重试（共 len+1 次尝试）。
 // 返回的 error 仅在真正失败（网络/业务错误）时非 nil；已签到/未开放走 result。
 func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
 	var lastErr error
@@ -418,10 +430,11 @@ func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
 			return res, nil
 		}
 		lastErr = err
-		// 9074 换设备号无效（失败跟账号走），只做一次快速重试。
+		// 9074 是瞬时限流：退避等一会儿再试即可（换设备号无用，限流跟设备/账号走）。
 		var ue *Error
 		if errors.As(err, &ue) && ue.Kind == ErrCheckinDenied && attempt < len(checkinRetryDelays) {
-			time.Sleep(checkinRetryDelays[attempt])
+			d := checkinRetryDelays[attempt]
+			time.Sleep(d + checkinRetryJitter(d))
 			continue
 		}
 		return res, lastErr
