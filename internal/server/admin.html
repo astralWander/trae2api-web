@@ -28,6 +28,15 @@
   .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
   .pane { display:none; }
   .pane.active { display:block; }
+  /* 总积分汇总条 */
+  .summary { display:flex; gap:26px; flex-wrap:wrap; align-items:flex-end; background:var(--card);
+             border:1px solid #232836; border-radius:12px; padding:16px 20px; margin-bottom:18px; }
+  .summary .s-item { display:flex; flex-direction:column; gap:2px; }
+  .summary .s-num { font-size:26px; font-weight:700; font-variant-numeric:tabular-nums; line-height:1.1; }
+  .summary .s-num.accent { color:var(--accent); }
+  .summary .s-label { font-size:11px; color:var(--dim); }
+  .summary .s-sub { font-size:11px; color:var(--dim); }
+  .summary .s-sub b { color:var(--fg); font-weight:600; }
   /* key bar */
   .keybar { display:flex; gap:8px; align-items:center; margin-bottom:14px; font-size:12px; color:var(--dim); flex-wrap:wrap; }
   .keybar input { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
@@ -114,6 +123,16 @@
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
   </div>
 
+  <!-- 总积分汇总（全账号合计，实时查上游） -->
+  <div class="summary" id="summary" style="display:none">
+    <div class="s-item"><div class="s-num accent" id="sRemain">-</div><div class="s-label">总剩余积分</div></div>
+    <div class="s-item"><div class="s-num" id="sLimit">-</div><div class="s-label">总额度</div></div>
+    <div class="s-item"><div class="s-num" id="sUsed">-</div><div class="s-label">总已用</div></div>
+    <div class="s-item"><div class="s-num" id="sAccts">-</div><div class="s-label">账号数</div>
+      <div class="s-sub" id="sAcctsSub"></div></div>
+    <div class="s-item"><div class="s-num" id="sPending">-</div><div class="s-label">今日待签到</div></div>
+  </div>
+
   <!-- 账号管理 -->
   <div id="pane-accounts" class="pane active">
     <div class="login-bar">
@@ -171,6 +190,18 @@ function apiErr(d, fallback){
   return (d && (d.error?.message || d.message)) || fallback || '请求失败';
 }
 function getKey(){ return document.getElementById('apikey').value.trim(); }
+
+/* 总积分汇总条（数据来自 /admin/api/credits 的 total 字段） */
+function renderSummary(t){
+  if(!t) return;
+  document.getElementById('summary').style.display = '';
+  document.getElementById('sRemain').textContent = fmt(t.remain);
+  document.getElementById('sLimit').textContent = fmt(t.limit);
+  document.getElementById('sUsed').textContent = fmt(t.used);
+  document.getElementById('sAccts').textContent = fmt(t.ok) + ' / ' + fmt(t.accounts);
+  document.getElementById('sAcctsSub').innerHTML = '正常 <b>'+fmt(t.ok)+'</b> · 失败 <b>'+fmt(t.error||0)+'</b>';
+  document.getElementById('sPending').textContent = fmt(t.checkin_pending||0);
+}
 function onKeyChange(){ document.getElementById('keystatus').style.display='none'; }
 function saveKey(){
   localStorage.setItem('tw2a_admin_key', getKey());
@@ -210,6 +241,7 @@ async function enrichAccountCredits(){
   try{
     const r = await fetch('/admin/api/credits', {cache:'no-store'});
     const d = await r.json();
+    renderSummary(d.total);
     const map = {};
     (d.accounts||[]).forEach(a=>{ map[a.uid] = a; });
     document.querySelectorAll('[data-credit-uid]').forEach(td=>{
@@ -418,7 +450,9 @@ function renderCredits(d){
 async function loadCredits(){
   try{
     const r = await fetch('/admin/api/credits', {cache:'no-store'});
-    renderCredits(await r.json());
+    const d = await r.json();
+    renderSummary(d.total);
+    renderCredits(d);
   }catch(e){
     document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
   }

@@ -46,6 +46,7 @@ type fakeUpstream struct {
 	checkinCalls   atomic.Int32
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
+	claimed        atomic.Bool // claim 后 status 应报 checked_in=true
 	resourceRemain int64
 }
 
@@ -54,9 +55,14 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/status"):
 			f.checkinCalls.Add(1)
-			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			if f.claimed.Load() {
+				w.Write([]byte(`{"checked_in":true,"credits":200,"enable":true}`))
+			} else {
+				w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
+			}
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
+			f.claimed.Store(true)
 			w.Write([]byte(`{"code":0,"message":"success"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
 			w.Write([]byte(`{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":` +
@@ -104,8 +110,9 @@ func TestRunCheckinReenablesCoolingAccount(t *testing.T) {
 
 	s := newTestScheduler(f, p, srv)
 	s.RunCheckinNow()
-	if f.checkinCalls.Load() != 1 {
-		t.Errorf("checkin status calls=%d", f.checkinCalls.Load())
+	// status 两次：签到前查状态 + claim 后回查确认 checked_in。
+	if f.checkinCalls.Load() != 2 {
+		t.Errorf("checkin status calls=%d want 2", f.checkinCalls.Load())
 	}
 	if f.claimCalls.Load() != 1 {
 		t.Errorf("claim calls=%d", f.claimCalls.Load())

@@ -174,3 +174,87 @@ func TestNeedsRefreshLocked(t *testing.T) {
 		t.Error("expired token should need refresh under lock")
 	}
 }
+
+// TestIsRealDeviceID 校验设备号形态判定：只有 15~16 位纯数字才算真实形态。
+func TestIsRealDeviceID(t *testing.T) {
+	real := []string{"1711320556112436", "171132055611243", "1000000000000000"}
+	for _, s := range real {
+		if !IsRealDeviceID(s) {
+			t.Errorf("%q should be a real device id", s)
+		}
+	}
+	fake := []string{
+		"", "0123456789abcdef0123456789abcdef", // hex32（历史遗留）
+		"1b8a280e-0741-4d1b-9ba5-21d3907f3de6", // uuid
+		"12345", "17113205561124367", "12345678901234a",
+	}
+	for _, s := range fake {
+		if IsRealDeviceID(s) {
+			t.Errorf("%q should NOT be a real device id", s)
+		}
+	}
+}
+
+// TestNewDeviceIDForm 生成的设备号必须是 16 位纯数字且首位非 0。
+func TestNewDeviceIDForm(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		id := newDeviceID()
+		if len(id) != 16 || !IsRealDeviceID(id) {
+			t.Fatalf("newDeviceID()=%q not 16-digit numeric", id)
+		}
+		if id[0] == '0' {
+			t.Fatalf("newDeviceID()=%q leading zero", id)
+		}
+	}
+}
+
+// TestEnsureDeviceIDMigratesLegacy 存量 hex32 设备号必须被迁移为真实形态。
+func TestEnsureDeviceIDMigratesLegacy(t *testing.T) {
+	a := &Auth{DeviceID: "0123456789abcdef0123456789abcdef"}
+	if !a.EnsureDeviceID() {
+		t.Fatal("legacy hex32 device id should be migrated")
+	}
+	if !IsRealDeviceID(a.DeviceIDValue()) {
+		t.Errorf("migrated device id %q not real form", a.DeviceIDValue())
+	}
+	// 已是真实形态则不再改写。
+	if a.EnsureDeviceID() {
+		t.Error("real device id should not be regenerated")
+	}
+}
+
+// TestEnsureMarketUserID 首次生成 uuid-v4，之后保持不变（保证指纹稳定）。
+func TestEnsureMarketUserID(t *testing.T) {
+	a := &Auth{}
+	if !a.EnsureMarketUserID() {
+		t.Fatal("first call should generate market user id")
+	}
+	first := a.MarketUserIDValue()
+	if len(first) != 36 || first[8] != '-' || first[13] != '-' {
+		t.Fatalf("market user id not uuid-v4: %q", first)
+	}
+	if a.EnsureMarketUserID() {
+		t.Error("second call should be a no-op")
+	}
+	if a.MarketUserIDValue() != first {
+		t.Error("market user id should be stable")
+	}
+}
+
+// TestSaveAtomicPreservesMarketUserID 市场用户 id 必须随凭证持久化。
+func TestSaveAtomicPreservesMarketUserID(t *testing.T) {
+	dir := t.TempDir()
+	a := &Auth{AccessToken: "at", RefreshToken: "rt", UID: "u1", MarketUserID: "m-1"}
+	a.FilePath = filepath.Join(dir, "trae-u1.json")
+	if err := a.SaveAtomic(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(a.FilePath)
+	b, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.MarketUserID != "m-1" {
+		t.Errorf("marketUserId=%q want m-1", b.MarketUserID)
+	}
+}

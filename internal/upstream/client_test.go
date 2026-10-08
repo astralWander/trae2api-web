@@ -5,12 +5,15 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"trae2api-web/internal/auth"
 )
+
+func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 
 func TestClassify(t *testing.T) {
 	cases := []struct {
@@ -276,8 +279,8 @@ func TestClassifyBusiness(t *testing.T) {
 		1001: ErrSessionDead,
 		1005: ErrPlanLimit,
 		4008: ErrPlanLimit,
-		4011: ErrCheckinBusy,
-		9074: ErrCheckinBusy,
+		4011: ErrSoftRate,
+		9074: ErrCheckinDenied,
 		9999: ErrClient,
 	}
 	for code, want := range cases {
@@ -298,7 +301,7 @@ func TestCheckinStatusBusinessErrorSurfaced(t *testing.T) {
 		t.Fatal("HTTP200 business code 9074 must surface as error")
 	}
 	var ue *Error
-	if !errors.As(err, &ue) || ue.Kind != ErrCheckinBusy || ue.Code != 9074 {
+	if !errors.As(err, &ue) || ue.Kind != ErrCheckinDenied || ue.Code != 9074 {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -320,29 +323,116 @@ func TestCheckinClaimBusinessErrorNotSilent(t *testing.T) {
 	}
 }
 
-// 9074 高峰拥堵应自动退避重试，重试后成功返回 CheckinDone。
-func TestCheckinRetriesBusyThenSucceeds(t *testing.T) {
+// 9074 应做一次快速重试，重试后成功返回 CheckinDone（并回查 status 确认）。
+func TestCheckinRetriesDeniedThenSucceeds(t *testing.T) {
 	old := checkinRetryDelays
-	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
+	checkinRetryDelays = []time.Duration{time.Millisecond}
 	defer func() { checkinRetryDelays = old }()
 
 	var claimN int
+	done := false
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "/claim") {
 			claimN++
-			if claimN < 3 {
-				return jsonResp(200, `{"code":9074,"message":"当前使用人数太多"}`), nil
+			if claimN < 2 {
+				return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
 			}
+			done = true
 			return jsonResp(200, `{"code":0,"message":"success"}`), nil
 		}
-		return jsonResp(200, `{"checked_in":false,"credits":200,"enable":true}`), nil
+		if done { // claim 后回查：上游应标记 checked_in
+			return jsonResp(200, `{"checked_in":true,"credits":100,"enable":true}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
 	})
 	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
-	if res != CheckinDone || claimN != 3 {
-		t.Fatalf("res=%v claimN=%d want CheckinDone/3", res, claimN)
+	if res != CheckinDone || claimN != 2 {
+		t.Fatalf("res=%v claimN=%d want CheckinDone/2", res, claimN)
+	}
+}
+
+// claim 返回 code 0 但回查 status 仍 checked_in=false → 判失败，绝不谎报成功。
+func TestCheckinCodeZeroButNotEffective(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
+	})
+	if _, err := c.Checkin(&auth.Auth{AccessToken: "at"}); err == nil {
+		t.Fatal("code 0 without checked_in must be treated as failure")
+	}
+}
+
+// claim 返回 9095（今日已签到）→ 幂等成功，报 already。
+func TestCheckinClaim9095IsAlready(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			return jsonResp(200, `{"code":9095,"message":"今日已签到"}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
+	})
+	res, err := c.Checkin(&auth.Auth{AccessToken: "at"})
+	if err != nil || res != CheckinAlready {
+		t.Fatalf("res=%v err=%v want CheckinAlready", res, err)
+	}
+}
+
+// claim/status 请求体为空对象，且带上 ug 插件头与 X-Device-Id。
+func TestCheckinRequestShape(t *testing.T) {
+	var gotBody []byte
+	var gotUA, gotAccept, gotDev, gotMkt string
+	a := &auth.Auth{AccessToken: "at"}
+	_ = a.EnsureDeviceID()
+	_ = a.EnsureMarketUserID()
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(r.Body)
+		gotUA = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		gotDev = r.Header.Get("X-Device-Id")
+		gotMkt = r.Header.Get("X-Market-User-Id")
+		return jsonResp(200, `{"checked_in":true,"credits":100,"enable":true}`), nil
+	})
+	if _, _, _, err := c.CheckinStatus(a); err != nil {
+		t.Fatal(err)
+	}
+	if string(gotBody) != "{}" {
+		t.Errorf("body=%q want {}", string(gotBody))
+	}
+	if gotUA != UgUserAgent {
+		t.Errorf("UA=%q want %q", gotUA, UgUserAgent)
+	}
+	if gotAccept != "*/*" {
+		t.Errorf("Accept=%q want */*", gotAccept)
+	}
+	if !auth.IsRealDeviceID(gotDev) {
+		t.Errorf("X-Device-Id=%q not a real 16-digit device id", gotDev)
+	}
+	if gotMkt == "" {
+		t.Errorf("X-Market-User-Id missing")
+	}
+}
+
+// 过期权益包必须跳过，否则历史签到包会把「剩余」越算越多。
+func TestEntUsageSkipsExpiredPacks(t *testing.T) {
+	now := time.Now().Unix()
+	expired := now - 3600
+	future := now + 3600
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"user_entitlement_pack_list":[
+			{"entitlement_base_info":{"quota":{"credits_limit":1000},"end_time":`+itoa(future)+`},"usage":{"credits_amount":200}},
+			{"entitlement_base_info":{"quota":{"credits_limit":500},"end_time":`+itoa(expired)+`},"usage":{"credits_amount":0}}
+		]}`), nil
+	})
+	remain, limit, used, packs, err := c.EntUsage(&auth.Auth{AccessToken: "at"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remain != 800 || limit != 1000 || used != 200 || packs != 1 {
+		t.Fatalf("remain=%d limit=%d used=%d packs=%d want 800/1000/200/1", remain, limit, used, packs)
 	}
 }
 

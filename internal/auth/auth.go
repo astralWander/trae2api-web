@@ -31,7 +31,8 @@ type Auth struct {
 	Domain       string // "trae.cn"
 	ApiHost      string // "https://api.trae.com.cn"（ExchangeToken host）
 	MachineID    string // x-machine-id
-	DeviceID     string // x-device-id
+	DeviceID     string // x-device-id（须为 15~16 位纯数字，见 IsRealDeviceID）
+	MarketUserID string // x-market-user-id（客户端本地分配，随凭证持久化）
 	UID          string
 	EnterpriseID string
 	Nickname     string
@@ -57,43 +58,98 @@ func (a *Auth) JWT() string {
 	return a.AccessToken
 }
 
-// DeviceIDValue 返回当前 deviceID 的读锁快照（Ensure/Rotate 会改写该字段）。
+// DeviceIDValue 返回当前 deviceID 的读锁快照（EnsureDeviceID 会改写该字段）。
 func (a *Auth) DeviceIDValue() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.DeviceID
 }
 
-// EnsureDeviceID 若未设置 deviceID，则生成一个 32 位 hex 随机设备号写入内存。
-// 返回是否本次新生成（调用方据此决定是否 SaveAtomic 落盘）。
+// MarketUserIDValue 返回当前 marketUserId 的读锁快照。
+func (a *Auth) MarketUserIDValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.MarketUserID
+}
+
+// IsRealDeviceID 报告 deviceID 是否为真实客户端形态（15~16 位纯数字）。
 //
-// 背景：签到 claim 接口要求带 X-Device-Id 头，缺失会返回 9004
-// "The submitted order parameters are incorrect"（实测）。
+// 上游把 x-device-id 当设备指纹：真实客户端实测值形如 `1711320556112436`（16 位纯数字）。
+// 发 hex32 / UUID 在风控眼里根本不是设备号，签到会被判无效并**稳定返回 9074**
+// 「当前参与用户太多」（实测：换成 16 位数字后立即 code 0 签到成功）。
+func IsRealDeviceID(id string) bool {
+	if len(id) < 15 || len(id) > 16 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// EnsureDeviceID 确保 deviceID 为真实形态（15~16 位纯数字）。
+// 未设置、或存的是历史遗留的 hex32/UUID，都会重新生成；返回是否本次改写
+// （调用方据此决定是否 SaveAtomic 落盘）。
+//
+// 迁移安全性：上游判重维度是**账号**不是设备（换 deviceId 后 checked_in 仍为 true），
+// 所以把存量凭证的 hex32 一次性迁到数字形态不会导致重复签到。
+//
+// 背景：x-device-id 缺失会返回 9004「The submitted order parameters are incorrect」；
+// 形态不对（hex32/UUID）则稳定 9074（均实测）。
 func (a *Auth) EnsureDeviceID() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.DeviceID != "" {
+	if IsRealDeviceID(a.DeviceID) {
 		return false
 	}
 	a.DeviceID = newDeviceID()
 	return true
 }
 
-// RotateDeviceID 强制换一个新的设备号（仅内存）。
-// 用于 9074「当前参与用户太多」——服务端会记住被高频使用的设备号，换号可提高成功率。
-func (a *Auth) RotateDeviceID() {
+// EnsureMarketUserID 若未设置 marketUserId 则生成一个 uuid-v4；返回是否本次新生成。
+//
+// 该 id 服务端不提供（抓包所有响应体都没有它），由客户端本地为该账号分配并持久化。
+// 每次请求现生成会破坏指纹稳定性——真实客户端对同一账号始终发同一个值。
+func (a *Auth) EnsureMarketUserID() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.DeviceID = newDeviceID()
+	if a.MarketUserID != "" {
+		return false
+	}
+	a.MarketUserID = newMarketUserID()
+	return true
 }
 
-// newDeviceID 生成 32 位 hex 随机设备号（16 字节）。
+// newDeviceID 生成 16 位纯数字设备号（首位 1-9，保证恰好 16 位）。
+//
+// 形态须对齐真实客户端。**不能用 `10^15 + rand` 那种写法**：那会把高位钉死在
+// `1xxxxx`，批量生成的号共享可识别前缀，反而给风控递「同一生成器批发」的特征。
+// 首位取 1-9（不能是 0，否则不是 16 位），后 15 位逐位均匀取 0-9。
 func newDeviceID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return ""
 	}
-	return hex.EncodeToString(b[:])
+	out := make([]byte, 16)
+	out[0] = '1' + (b[0] % 9) // '1'..'9'
+	for i := 1; i < 16; i++ {
+		out[i] = '0' + (b[i] % 10)
+	}
+	return string(out)
+}
+
+// newMarketUserID 生成 uuid-v4 形标识（8-4-4-4-12）。
+func newMarketUserID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }
 
 // RefreshTokenValue 返回当前 refreshToken 的读锁快照，防与 RefreshToken 写并发竞态。
@@ -131,6 +187,7 @@ func parseNested(raw []byte) (*Auth, error) {
 			ApiHost      string `json:"apiHost"`
 			MachineID    string `json:"machineId"`
 			DeviceID     string `json:"deviceId"`
+			MarketUserID string `json:"marketUserId"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -149,6 +206,7 @@ func parseNested(raw []byte) (*Auth, error) {
 		ApiHost:      n.Auth.ApiHost,
 		MachineID:    n.Auth.MachineID,
 		DeviceID:     n.Auth.DeviceID,
+		MarketUserID: n.Auth.MarketUserID,
 		UID:          n.Account.UID,
 		EnterpriseID: n.Account.EnterpriseID,
 		Nickname:     n.Account.Nickname,
@@ -167,6 +225,7 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost      string `json:"apiHost"`
 		MachineID    string `json:"machineId"`
 		DeviceID     string `json:"deviceId"`
+		MarketUserID string `json:"marketUserId"`
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
@@ -182,6 +241,7 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost:      f.ApiHost,
 		MachineID:    f.MachineID,
 		DeviceID:     f.DeviceID,
+		MarketUserID: f.MarketUserID,
 		UID:          f.UID,
 		EnterpriseID: f.EnterpriseID,
 		Nickname:     f.Nickname,
@@ -240,6 +300,7 @@ func (a *Auth) saveAtomicLocked() error {
 			"apiHost":      a.ApiHost,
 			"machineId":    a.MachineID,
 			"deviceId":     a.DeviceID,
+			"marketUserId": a.MarketUserID,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,

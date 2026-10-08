@@ -74,8 +74,34 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 
+	// 全账号合计（只统计查询成功的账号，失败的不计入，避免把 error 当 0 拉低总数）。
+	var totRemain, totLimit, totUsed int64
+	var okN, errN, pendingN int
+	for _, a := range out {
+		if a.Error != "" {
+			errN++
+			continue
+		}
+		okN++
+		totRemain += a.Remain
+		totLimit += a.Limit
+		totUsed += a.Used
+		if !a.CheckedIn && a.CheckinEnable {
+			pendingN++ // 今日尚未签到
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"fetched_at": time.Now().Format("2006-01-02 15:04:05"),
 		"accounts":   out,
+		"total": map[string]any{
+			"remain":      totRemain,
+			"limit":       totLimit,
+			"used":        totUsed,
+			"accounts":    len(out),
+			"ok":          okN,
+			"error":       errN,
+			"checkin_pending": pendingN,
+		},
 	})
 }

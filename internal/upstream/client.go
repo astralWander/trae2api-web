@@ -27,7 +27,7 @@ const (
 	ErrNotFound                   // 404 → 短冷却 60s 不累计 errCount
 	ErrServer                     // 5xx
 	ErrClient                     // 其他 4xx
-	ErrCheckinBusy                // 9074 签到人数过多（HTTP 200 业务码）→ 可退避重试
+	ErrCheckinDenied              // 9074 签到专属拒绝（HTTP 200 业务码）→ 可单次快速重试
 )
 
 func (k ErrKind) String() string {
@@ -44,8 +44,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
-	case ErrCheckinBusy:
-		return "checkin_busy"
+	case ErrCheckinDenied:
+		return "checkin_denied"
 	default:
 		return "none"
 	}
@@ -109,9 +109,12 @@ func ClassifyBusiness(code int64) ErrKind {
 		return ErrSessionDead
 	case 1005, 4008:
 		return ErrPlanLimit
-	case 4011, 9074:
-		// 4011 请求频率超限 / 9074 签到人数过多 → 可重试
-		return ErrCheckinBusy
+	case 4011:
+		// 请求频率超限 → 短冷却
+		return ErrSoftRate
+	case 9074:
+		// 签到专属拒绝，与 chat 限流无关，单列一类以免污染限流计数
+		return ErrCheckinDenied
 	default:
 		return ErrClient
 	}
@@ -394,12 +397,18 @@ func (r CheckinResult) String() string {
 	}
 }
 
-// checkinRetryDelays 9074「签到人数过多」等可重试错误的退避间隔。
-// 变量形式便于测试缩短。
-var checkinRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
+// checkinRetryDelays 9074「签到专属拒绝」的重试间隔。
+//
+// 上游 9074 是**账号级稳定拒绝**（实测：同账号 40 余次请求全 9074，换 deviceId/token/
+// UA/region/body 均无效），不是短时抖动。保留一次快速重试只为兜「万一上游恢复成真
+// 抖动」，落空即判失败，不空耗 8s。变量形式便于测试缩短。
+var checkinRetryDelays = []time.Duration{time.Second}
 
-// Checkin 执行一次完整签到：查状态 → 未签且开放则 claim。
-// 遇到 9074（签到人数过多）等可重试错误按 checkinRetryDelays 退避重试。
+// checkinAlreadyCode 今日已签到（幂等成功，不算失败）。
+const checkinAlreadyCode = 9095
+
+// Checkin 执行一次完整签到：查状态 → 未签且开放则 claim → 回查确认。
+// 遇到 9074（签到专属拒绝）按 checkinRetryDelays 单次快速重试。
 // 返回的 error 仅在真正失败（网络/业务错误）时非 nil；已签到/未开放走 result。
 func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
 	var lastErr error
@@ -409,12 +418,9 @@ func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
 			return res, nil
 		}
 		lastErr = err
+		// 9074 换设备号无效（失败跟账号走），只做一次快速重试。
 		var ue *Error
-		if errors.As(err, &ue) && ue.Kind == ErrCheckinBusy && attempt < len(checkinRetryDelays) {
-			// 9074 多因服务端记住了该设备号，换一个新设备号再试。
-			if ue.Code == 9074 {
-				a.RotateDeviceID()
-			}
+		if errors.As(err, &ue) && ue.Kind == ErrCheckinDenied && attempt < len(checkinRetryDelays) {
 			time.Sleep(checkinRetryDelays[attempt])
 			continue
 		}
@@ -423,6 +429,11 @@ func (c *Client) Checkin(a *auth.Auth) (CheckinResult, error) {
 }
 
 // checkinOnce 单次签到（不重试）。
+//
+// 判定规则（对齐上游语义）：
+//   - 只看 HTTP 状态会误报成功（上游一律 200，成败藏在 body code）
+//   - claim 拿到 code 0 也要**回查 status.checked_in** 才算数
+//   - 已签到（status.checked_in=true 或 claim 返回 9095）是幂等成功
 func (c *Client) checkinOnce(a *auth.Auth) (CheckinResult, error) {
 	checkedIn, _, enable, err := c.CheckinStatus(a)
 	if err != nil {
@@ -434,28 +445,45 @@ func (c *Client) checkinOnce(a *auth.Auth) (CheckinResult, error) {
 	if !enable {
 		return CheckinDisabled, nil
 	}
-	if err := c.CheckinClaim(a); err != nil {
+	claimed, err := c.CheckinClaim(a)
+	if err != nil {
 		return CheckinDisabled, err
+	}
+	if claimed == CheckinAlready {
+		return CheckinAlready, nil
+	}
+	// claim 返回 code 0：回查确认，上游确实标记 checked_in 才算签到成功。
+	after, _, _, err := c.CheckinStatus(a)
+	if err != nil {
+		return CheckinDisabled, err
+	}
+	if !after {
+		return CheckinDisabled, fmt.Errorf("checkin not effective: upstream did not mark checked_in")
 	}
 	return CheckinDone, nil
 }
 
-// checkinReqBody 签到接口请求体（与桌面端一致；空 body 会被上游拒绝）。
-var checkinReqBody = []byte(`{"req_source":1}`)
+// checkinReqBody 签到接口请求体。真实客户端 status/claim 均发空对象（2026-09-03 抓包实测）。
+var checkinReqBody = []byte(`{}`)
 
-// ensureDeviceID 确保账号已有 deviceID（claim 接口必填，缺失 → 9004），必要时生成并落盘。
-func (c *Client) ensureDeviceID(a *auth.Auth) {
-	if a.DeviceIDValue() != "" {
-		return
+// ensureIdentity 确保账号具备完整的 ug 请求身份：真实形态 deviceId（15~16 位数字）
+// + marketUserId（uuid-v4）。必要时生成并落盘。
+//
+// deviceId 形态是签到成败的关键：hex32/UUID 会被风控判为无效设备 → 稳定 9074；
+// 缺失则 9004。两者都是实测踩过的坑。
+func (c *Client) ensureIdentity(a *auth.Auth) {
+	changed := a.EnsureDeviceID()
+	if a.EnsureMarketUserID() {
+		changed = true
 	}
-	if a.EnsureDeviceID() && a.FilePath != "" {
+	if changed && a.FilePath != "" {
 		_ = a.SaveAtomic()
 	}
 }
 
 // CheckinStatus 查询签到状态。
 func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
-	c.ensureDeviceID(a)
+	c.ensureIdentity(a)
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinStatus, bytes.NewReader(checkinReqBody))
 	if err != nil {
 		return false, 0, false, err
@@ -476,28 +504,42 @@ func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, ena
 	return resp.CheckedIn, resp.Credits, resp.Enable, nil
 }
 
-// CheckinClaim 执行签到。
-func (c *Client) CheckinClaim(a *auth.Auth) error {
-	c.ensureDeviceID(a)
+// CheckinClaim 执行签到。成功与否看业务 code：0 → CheckinDone；9095 → CheckinAlready。
+func (c *Client) CheckinClaim(a *auth.Auth) (CheckinResult, error) {
+	c.ensureIdentity(a)
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpCheckinClaim, bytes.NewReader(checkinReqBody))
 	if err != nil {
-		return err
+		return CheckinDisabled, err
 	}
 	UgHeaders(req, a)
-	_, err = c.doJSON(req)
-	return err
+	if _, err := c.doJSON(req); err != nil {
+		// 9095 = 今日已签到（幂等成功，不是失败）。
+		var ue *Error
+		if errors.As(err, &ue) && ue.Code == checkinAlreadyCode {
+			return CheckinAlready, nil
+		}
+		return CheckinDisabled, err
+	}
+	return CheckinDone, nil
 }
 
-// UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。
+// entUsageBody ide_user_ent_usage 的请求体。真实客户端发这两个字段；
+// 发空对象 `{}` 拿到的 usage 不完整（2026-09-03 抓包实测）。
+var entUsageBody = []byte(`{"require_usage":true,"req_source":2}`)
+
+// UserEntUsage 聚合积分（仅未过期权益包的剩余额度）。
 func (c *Client) UserEntUsage(a *auth.Auth) (remain int64, err error) {
 	remain, _, _, _, err = c.EntUsage(a)
 	return remain, err
 }
 
-// EntUsage 查询账号额度明细（积分总量/已用/剩余/权益包数）。
+// EntUsage 查询账号额度明细（权益包总量/已用/剩余/包数）。
 // remain = limit - used，usage.credits_amount 是已用积分（实测）。
+//
+// **过期包必须跳过**：签到积分是「当日发放、31 天后过期」的独立包。不过滤就是把
+// 历史上所有签到包的额度都算进「剩余」，面板越签越多、永远用不完，且掩盖真实余额。
 func (c *Client) EntUsage(a *auth.Auth) (remain, limit, used int64, packs int, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader(entUsageBody))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -512,8 +554,10 @@ func (c *Client) EntUsage(a *auth.Auth) (remain, limit, used int64, packs int, e
 				Quota struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
+				EndTime int64 `json:"end_time"`
 			} `json:"entitlement_base_info"`
-			Usage struct {
+			ExpireTime int64 `json:"expire_time"`
+			Usage      struct {
 				CreditsAmount float64 `json:"credits_amount"`
 			} `json:"usage"`
 		} `json:"user_entitlement_pack_list"`
@@ -521,9 +565,18 @@ func (c *Client) EntUsage(a *auth.Auth) (remain, limit, used int64, packs int, e
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("ent usage parse: %w", err)
 	}
+	nowSec := time.Now().Unix()
 	for _, p := range resp.UserEntitlementPackList {
 		l := p.EntitlementBaseInfo.Quota.CreditsLimit
 		if l <= 0 {
+			continue
+		}
+		// 过期判定：end_time / expire_time 为 Unix 秒；缺失或 0 视作不过期。
+		et := p.EntitlementBaseInfo.EndTime
+		if et == 0 {
+			et = p.ExpireTime
+		}
+		if et > 0 && et <= nowSec {
 			continue
 		}
 		u := int64(p.Usage.CreditsAmount)

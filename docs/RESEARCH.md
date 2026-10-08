@@ -48,10 +48,15 @@
 | `work_credits` | TRAE Work 编程 Agent | 不可用（见下文说明） |
 
 - 额度查询：`POST /trae/api/v2/pay/ide_user_ent_usage`（聚合 `user_entitlement_pack_list[].entitlement_base_info.quota.credits_limit`，`usage.credits_amount` 为已用）
+  - body 必须为 `{"require_usage":true,"req_source":2}`（发 `{}` 拿不到完整 usage）
+  - **必须跳过已过期权益包**（`end_time`/`expire_time` ≤ now）：签到积分是「当日发放、31 天后过期」的独立包，不过滤会把历史签到包累加进「剩余」，面板越签越多
 - **注意**：`ide_user_ent_usage` 聚合的是 entitlement 包（含 work 包），显示 `remain=2000` 实为 work_credits，**不代表 SOLO 通道可用额度**。SOLO 真正看 `notify_usage.cn_credits_remain_info.ide_credits`
-- 签到：`POST /trae/api/v2/ug/checkin_credits/status` + `/claim`，body 必须为 `{"req_source":1}`
-  - **claim 必须带 `X-Device-Id` 头**（status 不需要）：缺失 → HTTP 200 + `code 9004 The submitted order parameters are incorrect`（实测 2026-10）
-  - 请求格式正确后高峰仍可能返回 `9074 当前参与用户太多` → 换设备号 + 退避重试（本项目已内置）
+- 签到：`POST /trae/api/v2/ug/checkin_credits/status` + `/claim`，body 均为 `{}`（2026-09-03 抓包实测）
+  - **ug 链路伪装的是 VSCode 插件进程**，与 chat 链路不是同一套身份：UA 必须是 `VSCode 1.107.1 (TRAE SOLO CN)`（不是 `Trae/0.1.61`），且带 `Accept: */*`、`Package-Type: stable_cn`、`X-Market-Client-Id`、`X-Request-Id`、`X-TT-Trace-Id`、`Sec-Fetch-*` 等（本项目 `UgHeaders` 已逐头对齐）
+  - **`X-Device-Id` 必须是 15~16 位纯数字**（真实客户端实测如 `1711320556112436`）：发 hex32 / UUID 在风控眼里不是设备号 → **稳定 9074**；缺失 → `code 9004`。本项目会自动把存量 hex32 迁移为数字形态（判重按账号，迁移不会重复签到）
+  - `9074 当前参与用户太多` 是**账号级稳定拒绝**，不是高峰抖动：换 deviceId/token/UA/region/body 均无效（实测同账号 40+ 次全 9074）。只做一次 1s 快速重试，落空即如实报失败，不空耗
+  - 业务码：`0` 成功（已签到后重复调用也返回 0，幂等）、`9095` 今日已签到、`9074` 账号级拒绝、`1001` 会话失效
+  - 判定规则：只看 HTTP 状态会误报成功（一律 200）；claim 拿到 code 0 也要**回查 `status.checked_in`** 才算数；**积分不能当签到凭据**（是所有包的聚合剩余额度）
   - 单日奖励 `status.credits + extra_credits`（免费 100，会员更高）；已签到判定用 `checked_in`
 - ide_credits 耗尽：对话报 `4008 Your requests have exceeded the quota`（视为配额限制，短时重试无效，等每日重置或签到）
 
@@ -76,8 +81,8 @@
 | 4001 | 参数无效（模型不存在/版本不匹配） | 升级 `IdeVersion` 或换模型 |
 | 4008 | 配额超限（ide_credits 耗尽） | 等每日重置 / 签到 |
 | 4011 | 请求频率超限 | 等限流窗口 |
-| 9004 | 签到参数错误（缺 `X-Device-Id`） | 补设备头 + `{"req_source":1}` |
-| 9074 | 签到人数过多 / 设备号被标记 | 换设备号 + 退避重试（已内置） |
+| 9004 | 签到参数错误（缺 `X-Device-Id`） | 补设备头（须 15~16 位数字形态） |
+| 9074 | 签到专属拒绝（账号级，非抖动） | 单次 1s 重试；多为设备号形态不对（必须数字，不能 hex32/UUID） |
 | 429 | 软限流 | 短冷却（60s） |
 
 ## 6. Windows 环境坑（本仓库实测修复）
