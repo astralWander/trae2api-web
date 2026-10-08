@@ -387,15 +387,22 @@ func TestCheckinRetriesDeniedMultipleTimesThenSucceeds(t *testing.T) {
 }
 
 // 9074 重试全部耗尽仍失败 → 返回错误且带 code 9074（绝不谎报成功）。
+//
+// 同时锁定「换设备号」策略：同设备只重试 1 次（本用例 delays 收成 1 个），
+// 之后每次重试都必须换一个**全新**的设备号。
 func TestCheckinRetriesExhaustedFails(t *testing.T) {
-	old := checkinRetryDelays
-	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
-	defer func() { checkinRetryDelays = old }()
+	oldDelays, oldMax, oldDelay := checkinRetryDelays, checkinMaxDeviceRotations, checkinRotateDelay
+	checkinRetryDelays = []time.Duration{time.Millisecond}
+	checkinMaxDeviceRotations = 2
+	checkinRotateDelay = time.Millisecond
+	defer func() {
+		checkinRetryDelays, checkinMaxDeviceRotations, checkinRotateDelay = oldDelays, oldMax, oldDelay
+	}()
 
-	var claimN int
+	var devs []string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		if strings.HasSuffix(r.URL.Path, "/claim") {
-			claimN++
+			devs = append(devs, r.Header.Get("X-Device-Id"))
 			return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
 		}
 		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
@@ -408,8 +415,70 @@ func TestCheckinRetriesExhaustedFails(t *testing.T) {
 	if !errors.As(err, &ue) || ue.Code != 9074 {
 		t.Fatalf("err=%v want code 9074", err)
 	}
-	if claimN != 3 { // 首次 + 2 次重试
-		t.Fatalf("claimN=%d want 3", claimN)
+	want := 1 + len(checkinRetryDelays) + checkinMaxDeviceRotations // 首试 + 同设备重试 + 换号重试
+	if len(devs) != want {
+		t.Fatalf("claim 次数=%d want %d（%v）", len(devs), want, devs)
+	}
+	if devs[0] == "" || devs[0] != devs[1] {
+		t.Fatalf("前两次应沿用同一设备号: %v", devs)
+	}
+	seen := map[string]bool{devs[0]: true}
+	for _, d := range devs[2:] {
+		if !auth.IsRealDeviceID(d) {
+			t.Fatalf("换号后应是 15~16 位纯数字，得到 %q（%v）", d, devs)
+		}
+		if seen[d] {
+			t.Fatalf("设备号被重复使用：%q（%v）", d, devs)
+		}
+		seen[d] = true
+	}
+	if !strings.Contains(err.Error(), "已轮换 2 个 deviceId") {
+		t.Fatalf("错误应说明已换号次数，实际: %v", err)
+	}
+}
+
+// 9074 之后换新设备号 → 签到成功（这就是 3 个账号实测的路径）。
+func TestCheckinRotatesDeviceOn9074ThenSucceeds(t *testing.T) {
+	oldDelays, oldMax, oldDelay := checkinRetryDelays, checkinMaxDeviceRotations, checkinRotateDelay
+	checkinRetryDelays = []time.Duration{time.Millisecond} // 同设备只重试 1 次
+	checkinMaxDeviceRotations = 3
+	checkinRotateDelay = time.Millisecond
+	defer func() {
+		checkinRetryDelays, checkinMaxDeviceRotations, checkinRotateDelay = oldDelays, oldMax, oldDelay
+	}()
+
+	var devs []string
+	done := false
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/claim") {
+			devs = append(devs, r.Header.Get("X-Device-Id"))
+			if len(devs) < 3 { // 原号两次 9074，换号后成功
+				return jsonResp(200, `{"code":9074,"message":"当前参与用户太多"}`), nil
+			}
+			done = true
+			return jsonResp(200, `{"code":0,"message":"success"}`), nil
+		}
+		if done {
+			return jsonResp(200, `{"checked_in":true,"credits":100,"enable":true}`), nil
+		}
+		return jsonResp(200, `{"checked_in":false,"credits":100,"enable":true}`), nil
+	})
+	a := &auth.Auth{AccessToken: "at"}
+	res, err := c.Checkin(a)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if res != CheckinDone || len(devs) != 3 {
+		t.Fatalf("res=%v claimN=%d want CheckinDone/3", res, len(devs))
+	}
+	if devs[0] != devs[1] {
+		t.Fatalf("前两次应同号: %v", devs)
+	}
+	if devs[2] == devs[0] || !auth.IsRealDeviceID(devs[2]) {
+		t.Fatalf("第三次应换成新的 16 位数字号: %v", devs)
+	}
+	if got := a.DeviceIDValue(); got != devs[2] {
+		t.Fatalf("Auth 上的 deviceId 应已更新为 %q，实际 %q", devs[2], got)
 	}
 }
 

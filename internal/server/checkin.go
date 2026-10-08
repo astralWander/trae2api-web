@@ -1,11 +1,13 @@
 // checkin.go /admin/api/checkin：面板手动触发签到（写操作，需 TW2A_API_KEY）。
 //
-// 复用 upstream.Checkin（status → claim + 9074 退避重试），签到后顺带刷新积分并解冻冷却账号。
+// 复用 upstream.Checkin（status → claim；遇 9074 自动换设备号重试），
+// 签到后顺带刷新积分并解冻冷却账号；若换过设备号则立即落盘。
 package server
 
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -21,6 +23,8 @@ type checkinEntry struct {
 	Detail    string `json:"detail,omitempty"`
 	Remain    int64  `json:"remain"`
 	HasRemain bool   `json:"has_remain"`
+	// RotatedDeviceID 非空表示本次因 9074 换了设备号（已落盘），便于排查/审计。
+	RotatedDeviceID string `json:"rotated_device_id,omitempty"`
 }
 
 // adminCheckin POST /admin/api/checkin：对所有账号（或 body.uid 指定单个）执行签到。
@@ -68,7 +72,16 @@ func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
 				out[i] = e
 				return
 			}
+			devBefore := a.DeviceIDValue()
 			res, err := h.cfg.Upstream.Checkin(a)
+			// Checkin 遇 9074 会自动换 deviceId；换了必须落盘，否则新号只活在内存里，
+			// 重启后又是旧号、下次照样 9074。
+			if devNow := a.DeviceIDValue(); devNow != devBefore {
+				if serr := a.SaveAtomic(); serr != nil {
+					log.Printf("checkin %s: 轮换设备号后落盘失败: %v", st.UID, serr)
+				}
+				e.RotatedDeviceID = devNow
+			}
 			if err != nil {
 				e.Status = "fail"
 				e.Detail = err.Error()

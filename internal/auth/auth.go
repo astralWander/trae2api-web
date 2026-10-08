@@ -108,6 +108,26 @@ func (a *Auth) EnsureDeviceID() bool {
 	return true
 }
 
+// RotateDeviceID 换一个**全新**的 16 位数字 deviceId（内存内改写），返回新值；
+// 随机源异常时返回空串且不改写。
+//
+// 用途：9074「当前参与用户太多」的实测对策。被上游拒绝的是 **(账号, deviceId)
+// 组合**，不是账号本身 —— 同一账号同一时刻，原设备号连续 20 次全 9074，
+// 换一个全新号即 code 0（2026-10-08 在 3 个失败账号上复现，各 +100 积分）。
+// 详见 upstream/client.go 中 checkinRetryDelays 的注释。
+//
+// 调用方必须在轮换后 SaveAtomic 落盘，否则新号只活在内存里，重启又从旧号开始。
+func (a *Auth) RotateDeviceID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := newDeviceID()
+	if id == "" {
+		return ""
+	}
+	a.DeviceID = id
+	return id
+}
+
 // EnsureMarketUserID 若未设置 marketUserId 则生成一个 uuid-v4；返回是否本次新生成。
 //
 // 该 id 服务端不提供（抓包所有响应体都没有它），由客户端本地为该账号分配并持久化。
