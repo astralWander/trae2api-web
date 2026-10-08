@@ -2,22 +2,33 @@
 package server
 
 import (
+	"bytes"
 	_ "embed"
 	"net/http"
 	"sync"
 	"time"
 
 	"trae2api-web/internal/pool"
+	"trae2api-web/internal/version"
 )
 
 //go:embed admin.html
 var adminPageHTML []byte
 
+// buildPlaceholder admin.html 里的构建标识占位符，服务时替换为 version.Badge()。
+// 这样页面源码（curl /admin 即可）直接带版本号，无需 JS/接口也能核对是否拉取成功。
+var buildPlaceholder = []byte("__TW2A_BUILD__")
+
 // adminPage 返回内嵌 HTML 面板（深色简洁风，无外部依赖）。
 func (h *Handler) adminPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(adminPageHTML)
+	_, _ = w.Write(renderAdminPage())
+}
+
+// renderAdminPage 把构建标识注入内嵌 HTML 的占位符。
+func renderAdminPage() []byte {
+	return bytes.ReplaceAll(adminPageHTML, buildPlaceholder, []byte(version.Badge()))
 }
 
 // adminCredits 查询全部账号的实时额度 + 签到状态（并发拉取上游）。

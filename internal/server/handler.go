@@ -77,6 +77,7 @@ func NewHandler(cfg Config) *Handler {
 	// 读接口无鉴权（局域网内只读）；写接口（accounts 写/login/refresh/authorize）
 	// 经 withAdminAuth 校验 Bearer = TW2A_API_KEY（见 §4 安全设计）。
 	h.mux.HandleFunc("GET /admin", h.adminPage)
+	h.mux.HandleFunc("GET /admin/api/version", h.adminVersion)
 	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
 	// 账号 CRUD
 	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)

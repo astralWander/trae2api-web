@@ -16,11 +16,14 @@ import (
 	"trae2api-web/internal/scheduler"
 	"trae2api-web/internal/server"
 	"trae2api-web/internal/upstream"
+	"trae2api-web/internal/version"
 )
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
+
+	log.Printf("trae2api-web build=%s (核对: git rev-parse --short HEAD)", version.Badge())
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -104,7 +107,7 @@ func main() {
 		}()
 	}
 
-	log.Printf("trae2api-web listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("trae2api-web %s listening on %s (api_key=%v)", version.ID(), cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

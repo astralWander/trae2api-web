@@ -22,6 +22,10 @@
   .btn.danger:hover { color:var(--bad); border-color:var(--bad); }
   .btn.sm { padding:4px 10px; font-size:12px; }
   #ts { color:var(--dim); font-size:12px; }
+  /* 构建标识角标：确认服务器是否已拉取/重启到最新代码 */
+  .build { font-size:11px; color:var(--dim); font-family:Consolas,monospace; background:var(--card);
+           border:1px solid #232836; border-radius:6px; padding:3px 9px; white-space:nowrap; cursor:help; }
+  .build b { color:var(--accent); font-weight:600; }
   /* tabs */
   .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid #232836; }
   .tab { padding:8px 16px; font-size:13px; cursor:pointer; color:var(--dim); border-bottom:2px solid transparent; }
@@ -102,6 +106,7 @@
   <header>
     <h1>trae2api-web 控制台<small>凭证管理 · 额度监控</small></h1>
     <div class="toolbar">
+      <span class="build" id="buildId" title="构建标识：用于确认服务器是否已更新">构建 <b>__TW2A_BUILD__</b></span>
       <span id="ts"></span>
       <button class="btn primary" id="ckBtn" onclick="doCheckin('')">一键签到</button>
       <button class="btn" onclick="refreshActive()">刷新</button>
@@ -458,8 +463,26 @@ async function loadCredits(){
   }
 }
 
+/* 构建标识：页面源码里已内联版本；这里再从接口补全 commit/启动时间到悬浮提示 */
+async function loadVersion(){
+  try{
+    const r = await fetch('/admin/api/version', {cache:'no-store'});
+    const d = await r.json();
+    const el = document.getElementById('buildId');
+    if(!el || !d) return;
+    if(d.badge) el.querySelector('b').textContent = d.badge;
+    el.title = '构建标识：用于确认服务器是否已更新\n'
+      + '提交：' + (d.commit || 'unknown') + (d.modified ? ' (有未提交改动)' : '') + '\n'
+      + '提交时间：' + (d.commit_time || '-') + '\n'
+      + 'Go：' + (d.go_version || '-') + '\n'
+      + '服务启动：' + (d.started_at || '-')
+      + '\n\n核对：本机 `git rev-parse --short HEAD` 应等于 ' + (d.short_commit || 'unknown');
+  }catch(e){ /* 角标已有内联版本，接口失败不提示 */ }
+}
+
 /* 初始 */
 loadAccounts();
+loadVersion();
 </script>
 </body>
 </html>
