@@ -60,6 +60,21 @@
   - 单日奖励 `status.credits + extra_credits`（免费 100，会员更高）；已签到判定用 `checked_in`
 - ide_credits 耗尽：对话报 `4008 Your requests have exceeded the quota`（视为配额限制，短时重试无效，等每日重置或签到）
 
+### 上下文缓存（prompt cache，2026-10-08 实测）
+
+上游**确实有前缀缓存**，命中时在 `event:token_usage` 里以 **Anthropic 口径**返回：
+
+```json
+{"prompt_tokens":2033, "cache_read_input_tokens":1792, "cache_creation_input_tokens":0,
+ "completion_tokens":137, "total_tokens":2170, "reasoning_tokens":135, "cluster":"normal_context"}
+```
+
+- **与「会话粘性」无关，也与账号无关**：用同一段 2033 token 的固定前缀对照 —— ① 不带 `session_id`（上游每次自分配新 session）；② 三次 `session_id` 互不相同；③ **换到另一个账号**（该账号首次访问此前缀）—— `cache_read_input_tokens` 均为 1792（回访时 1920）。⇒ 缓存键是**前缀内容本身**，落在上游的共享缓存池上（metadata 里的 `prompt_cache_pool_record` 即指向它），不是 per-session / per-account。
+- 实测 `prompt_cache_pool_record` 在无 session 复用时为 `null`，但缓存照样命中 —— 可佐证缓存不依赖会话。
+- **命中只影响计费**：`prompt_tokens` 仍按全量计（2033，其中 1792 命中）；`cache_creation_input_tokens` 在观察期内恒为 0（未见按写入计费）。
+- **坑（本仓库已修）**：这组字段名是 Anthropic 口径，原样透传时，读 OpenAI 规范（`usage.prompt_tokens_details.cached_tokens`）或 DeepSeek 口径（`usage.prompt_cache_hit_tokens`）的客户端**一个都读不到** → 界面上恒显示「缓存 0」，看起来像完全没命中。`normalizeUsage` 现在**只做加法**：上游原字段保留，另补 `prompt_tokens_details.cached_tokens`、`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`、`completion_tokens_details.reasoning_tokens`。
+- 本项目**不透传也不补发 `session_id`**（客户端请求体原样透传，上游自分配）；实测这与缓存命中无关。
+
 ## 4. work 通道为何不可反代
 
 引用公开逆向调查（[rosemarycox5334-debug/PA_Agent → TRADE_WORK_CN_INVESTIGATION.md](https://github.com/rosemarycox5334-debug/PA_Agent/blob/main/TRADE_WORK_CN_INVESTIGATION.md)，2026-08，**未在本仓库复现，引用结论**）：

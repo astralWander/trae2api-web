@@ -64,6 +64,58 @@ func (e *SOLOStreamError) Kind() ErrKind {
 	return ErrClient
 }
 
+// normalizeUsage 把上游 token_usage 补齐成主流客户端认识的形态（**只做加法**，
+// 上游原字段一律保留）。
+//
+// 背景（2026-10-08 实测）：上游命中上下文缓存时返回的是 Anthropic 风格字段
+//
+//	{"prompt_tokens":2033,"cache_read_input_tokens":1792,"cache_creation_input_tokens":0,...}
+//
+// 原样透传时，读 OpenAI 规范的客户端（`usage.prompt_tokens_details.cached_tokens`）
+// 与读 DeepSeek 口径的客户端（`usage.prompt_cache_hit_tokens`）都拿不到任何缓存
+// 信息 —— 于是界面上恒显示「缓存 0」。缓存其实一直在命中，只是字段名对不上。
+//
+// 补齐：
+//   - prompt_tokens_details.cached_tokens      （OpenAI 规范）
+//   - prompt_cache_hit_tokens / miss_tokens    （DeepSeek 口径）
+//   - completion_tokens_details.reasoning_tokens（OpenAI 规范，思考链 token）
+func normalizeUsage(u map[string]any) map[string]any {
+	if u == nil {
+		return u
+	}
+	num := func(k string) int64 {
+		if v, ok := u[k].(float64); ok {
+			return int64(v)
+		}
+		return 0
+	}
+	read, creation := num("cache_read_input_tokens"), num("cache_creation_input_tokens")
+
+	// OpenAI 规范：即使本次未命中也要给出，客户端才能稳定显示「0」而不是「-」。
+	if _, exists := u["prompt_tokens_details"]; !exists {
+		u["prompt_tokens_details"] = map[string]any{
+			"cached_tokens":         read,
+			"cache_creation_tokens": creation, // 非标准，但便于观察写入量
+		}
+	}
+	if _, exists := u["prompt_cache_hit_tokens"]; !exists {
+		u["prompt_cache_hit_tokens"] = read
+	}
+	if _, exists := u["prompt_cache_miss_tokens"]; !exists {
+		miss := num("prompt_tokens") - read - creation
+		if miss < 0 {
+			miss = 0
+		}
+		u["prompt_cache_miss_tokens"] = miss
+	}
+	if rt := num("reasoning_tokens"); rt > 0 {
+		if _, exists := u["completion_tokens_details"]; !exists {
+			u["completion_tokens_details"] = map[string]any{"reasoning_tokens": rt}
+		}
+	}
+	return u
+}
+
 // ParseSOLOLine 解析一条事件（eventName 为 event 行值，dataLine 为 data 行值）。
 func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	ev := &SOLOEvent{Event: strings.TrimSpace(eventName)}
@@ -86,7 +138,7 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 			ev.ToolCalls, _ = json.Marshal(tc)
 		}
 	case "token_usage":
-		ev.Usage = raw
+		ev.Usage = normalizeUsage(raw)
 	case "done":
 		if v, ok := raw["finish_reason"].(string); ok {
 			ev.FinishReason = v

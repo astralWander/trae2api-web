@@ -316,3 +316,152 @@ func TestPrepareBodyToolCallWithoutNameDropped(t *testing.T) {
 		t.Error("tool_call without name should be dropped")
 	}
 }
+
+// 上游 token_usage 实测样例（2026-10-08，本次命中上下文缓存 1792/2033）。
+const soloSSECacheFixture = "event:output\ndata:{\"response\":\"好\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n" +
+	"event:token_usage\ndata:{\"name\":\"\",\"prompt_tokens\":2033,\"completion_tokens\":123,\"total_tokens\":2156," +
+	"\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":1792,\"reasoning_tokens\":121,\"cluster\":\"normal_context\"}\n\n" +
+	"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+
+// 缓存字段必须被翻译成 OpenAI / DeepSeek 两套口径，否则客户端恒显示「缓存 0」。
+func TestNormalizeUsageAddsCompatibleCacheFields(t *testing.T) {
+	u := normalizeUsage(map[string]any{
+		"prompt_tokens":                float64(2033),
+		"completion_tokens":            float64(123),
+		"cache_read_input_tokens":      float64(1792),
+		"cache_creation_input_tokens":  float64(0),
+		"reasoning_tokens":             float64(121),
+		"prompt_cache_hit_tokens_total": float64(0), // 上游自带字段，不得被改
+	})
+	// 原字段保留（Anthropic 口径的客户端仍能读）
+	if u["cache_read_input_tokens"].(float64) != 1792 {
+		t.Errorf("原始字段被改动: %v", u["cache_read_input_tokens"])
+	}
+	// OpenAI 规范
+	det, ok := u["prompt_tokens_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("prompt_tokens_details 缺失: %#v", u)
+	}
+	if det["cached_tokens"].(int64) != 1792 {
+		t.Errorf("cached_tokens=%v", det["cached_tokens"])
+	}
+	// DeepSeek 口径
+	if u["prompt_cache_hit_tokens"].(int64) != 1792 {
+		t.Errorf("prompt_cache_hit_tokens=%v", u["prompt_cache_hit_tokens"])
+	}
+	if u["prompt_cache_miss_tokens"].(int64) != 241 { // 2033 - 1792
+		t.Errorf("prompt_cache_miss_tokens=%v", u["prompt_cache_miss_tokens"])
+	}
+	// 思考链 token
+	cd, ok := u["completion_tokens_details"].(map[string]any)
+	if !ok || cd["reasoning_tokens"].(int64) != 121 {
+		t.Errorf("completion_tokens_details=%v", u["completion_tokens_details"])
+	}
+}
+
+// 未命中缓存（首次请求）也要给出一致的 0，避免客户端显示成「-」。
+func TestNormalizeUsageColdCacheStillEmitsZero(t *testing.T) {
+	u := normalizeUsage(map[string]any{
+		"prompt_tokens":               float64(100),
+		"cache_read_input_tokens":     float64(0),
+		"cache_creation_input_tokens": float64(0),
+	})
+	if u["prompt_tokens_details"].(map[string]any)["cached_tokens"].(int64) != 0 {
+		t.Errorf("cached_tokens=%v", u["prompt_tokens_details"])
+	}
+	if u["prompt_cache_hit_tokens"].(int64) != 0 || u["prompt_cache_miss_tokens"].(int64) != 100 {
+		t.Errorf("hit/miss=%v/%v", u["prompt_cache_hit_tokens"], u["prompt_cache_miss_tokens"])
+	}
+	if _, has := u["completion_tokens_details"]; has {
+		t.Error("无 reasoning_tokens 时不应凭空造 completion_tokens_details")
+	}
+}
+
+// normalizeUsage 必须容忍 nil 与类型异常（上游字段可能缺失）。
+func TestNormalizeUsageNilAndOddTypes(t *testing.T) {
+	if got := normalizeUsage(nil); got != nil {
+		t.Errorf("nil 应原样返回: %#v", got)
+	}
+	u := normalizeUsage(map[string]any{"cache_read_input_tokens": "1792"}) // 字符串而非数字
+	if u["prompt_tokens_details"].(map[string]any)["cached_tokens"].(int64) != 0 {
+		t.Errorf("类型异常应退化为 0: %#v", u["prompt_tokens_details"])
+	}
+	if u["prompt_cache_miss_tokens"].(int64) != 0 { // 不可为负
+		t.Errorf("miss 不应为负: %v", u["prompt_cache_miss_tokens"])
+	}
+}
+
+func TestAggregateCarriesCachedTokens(t *testing.T) {
+	resp, err := Aggregate(strings.NewReader(soloSSECacheFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := resp["usage"].(map[string]any)
+	if _, ok := usage["prompt_tokens_details"].(map[string]any); !ok {
+		t.Fatalf("非流式 usage 缺 prompt_tokens_details: %#v", usage)
+	}
+	if got := usageInt(usage, "prompt_tokens_details", "cached_tokens"); got != 1792 {
+		t.Errorf("cached_tokens=%v", got)
+	}
+	if got := usageInt(usage, "prompt_cache_hit_tokens"); got != 1792 {
+		t.Errorf("prompt_cache_hit_tokens=%v", got)
+	}
+}
+
+func TestStreamCarriesCachedTokens(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(soloSSECacheFixture)); err != nil {
+		t.Fatal(err)
+	}
+	var usage map[string]any
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" || !strings.Contains(payload, `"usage"`) {
+			continue
+		}
+		var chunk map[string]any
+		if json.Unmarshal([]byte(payload), &chunk) != nil {
+			continue
+		}
+		if u, ok := chunk["usage"].(map[string]any); ok {
+			usage = u
+		}
+	}
+	if usage == nil {
+		t.Fatal("流式响应里没有带 usage 的 chunk")
+	}
+	// 注意：流式 usage 经过 json.Marshal/Unmarshal 往返，数字变成 float64，
+	// 不能直接断言 int64（会 panic）。
+	if got := usageInt(usage, "prompt_tokens_details", "cached_tokens"); got != 1792 {
+		t.Errorf("流式 cached_tokens=%v（usage=%#v）", got, usage)
+	}
+	if got := usageInt(usage, "prompt_cache_hit_tokens"); got != 1792 {
+		t.Errorf("流式 prompt_cache_hit_tokens=%v", got)
+	}
+}
+
+// usageInt 从嵌套 usage 里取整数，兼容 int64（未经过 JSON 往返）与
+// float64（经过往返）两种形态；路径不存在返回 -1。
+func usageInt(u map[string]any, path ...string) int64 {
+	var cur any = u
+	for _, k := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return -1
+		}
+		cur, ok = m[k]
+		if !ok {
+			return -1
+		}
+	}
+	switch v := cur.(type) {
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	}
+	return -1
+}
