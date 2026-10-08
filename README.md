@@ -138,31 +138,29 @@ TW2A_API_KEY=你的密钥 ./trae2api-web
 
 ### 2) 本地：运行签到程序
 
+本地签到程序是**独立的 Go 项目**（不在本仓库内，与 trae2api-web 完全解耦，只依赖标准库）：
+
 ```bash
-# 编译（在仓库目录内）
-go build -o localcheckin ./cmd/localcheckin
+# 进入本地签到程序目录（与本仓库同级的 localcheckin/，或它自己的仓库）
+cd ../localcheckin
+
+# 编译（Windows 双击 build.bat 即可）
+go build -o localcheckin .
+
+# 配置：复制模板并填 server / api_key
+cp config.example.json config.json
 
 # 只拉取并体检账号（验证是否拉取成功，不签到）
-./localcheckin -server http://你的服务器:7864 -key 你的密钥 -dry-run
+./localcheckin -dry-run
 
 # 在本机执行签到
-./localcheckin -server http://你的服务器:7864 -key 你的密钥
+./localcheckin
 ```
 
-也可用环境变量：`TW2A_SERVER`、`TW2A_API_KEY`。
+也支持命令行/环境变量临时覆盖配置：`-server`、`-key`、`-uid`、`-dry-run`、`-report=false`、
+`-save <dir>`、`-all`、`-concurrency`，以及 `TW2A_SERVER` / `TW2A_API_KEY`。
 
-常用参数：
-
-| 参数 | 说明 |
-|---|---|
-| `-server` | 服务端地址（默认 `http://127.0.0.1:7864`） |
-| `-key` | 服务端 API Key（或用 `TW2A_API_KEY`） |
-| `-uid` | 只处理指定账号 |
-| `-dry-run` | 只拉取并打印账号清单（含 deviceId 形态体检） |
-| `-report=false` | 不把结果回报服务端 |
-| `-save <dir>` | 把拉到的账号落盘到本地目录（默认仅内存） |
-| `-all` | 包含 session 失效账号（默认跳过） |
-| `-concurrency` | 并发账号数，默认 1（顺序执行最不易撞上游限流） |
+> 详见该项目的 `README.md`（含配置文件字段表与打包说明）。
 
 > **Token 续期提示**：本地签到会在 token 临近过期时自动续期，续期会**轮换 refreshToken**。
 > 程序默认把这批账号的新凭证回报服务端（`-report`），避免服务端手里那份旧凭证失效。
