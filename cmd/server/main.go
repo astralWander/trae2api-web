@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"trae2api-web/internal/auth"
+	"trae2api-web/internal/dotenv"
 	"trae2api-web/internal/pool"
 	"trae2api-web/internal/scheduler"
 	"trae2api-web/internal/server"
@@ -24,6 +26,9 @@ func main() {
 	flag.Parse()
 
 	log.Printf("trae2api-web build=%s (核对: git rev-parse --short HEAD)", version.Badge())
+
+	// 必须在 Load 之前：配置项全部来自环境变量，先让 .env 补上。
+	loadDotEnv()
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -112,4 +117,48 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// loadDotEnv 把 .env 注入进程环境变量，必须在 Load 之前调用。
+//
+// 为什么需要：本服务端的配置项只从环境变量读取（见 config.go 的 applyEnv），
+// 而 .env 文件只有 docker compose 会自动读 —— 二进制 / nohup / systemd 部署时
+// 它形同废纸，导致 TW2A_API_KEY 恒为空、/admin/api/accounts/export 一直 403。
+//
+// 开关：
+//   - TW2A_NO_DOTENV 设为任意非空值 → 关闭本次加载；
+//   - TW2A_ENV_FILE 指定文件名或绝对路径（默认 .env，相对当前工作目录）。
+//
+// 优先级：进程里【已有】的环境变量更高，绝不会被 .env 覆盖 ——
+// 这样 `export TW2A_API_KEY=xxx ./trae2api-web`、systemd 的 Environment=、
+// docker 的 -e 永远说了算，.env 只是「没别的来源时」的兜底。
+func loadDotEnv() {
+	if os.Getenv("TW2A_NO_DOTENV") != "" {
+		log.Printf("dotenv: 已按 TW2A_NO_DOTENV 关闭 .env 加载")
+		return
+	}
+	path := os.Getenv("TW2A_ENV_FILE")
+	if path == "" {
+		path = dotenv.DefaultFile
+	}
+	if _, err := os.Stat(path); err != nil {
+		log.Printf("dotenv: 未找到 %s（跳过；可用 TW2A_ENV_FILE 指定路径）", path)
+		return
+	}
+	res, err := dotenv.Load(path)
+	if err != nil {
+		log.Printf("dotenv: 读取 %s 失败: %v", path, err)
+		return
+	}
+	if len(res.Loaded) > 0 {
+		log.Printf("dotenv: %s 注入 %d 项: %s", res.Path, len(res.Loaded), strings.Join(res.Loaded, ", "))
+	}
+	if len(res.Kept) > 0 {
+		log.Printf("dotenv: %d 项因环境变量已存在而跳过（env 优先）: %s",
+			len(res.Kept), strings.Join(res.Kept, ", "))
+	}
+	if len(res.Invalid) > 0 {
+		log.Printf("dotenv: %s 有 %d 行无法解析，已跳过: %s",
+			res.Path, len(res.Invalid), strings.Join(res.Invalid, "; "))
+	}
 }
